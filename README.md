@@ -13,13 +13,36 @@ cTrader 版と MT5 版を同じ仕様から独立に実装している。判定�
 
 ## 導入
 
-**cTrader**: Automate → Indicators → New で `BBSqueezeAlert.cs` の中身を貼り付けてビルド。ログ書き込みのため `AccessRights.FullAccess` を要求する。ログは `Documents\cAlgo\Data\<Log_FileName>`。
+**cTrader**: Automate → Indicators → New で `BBSqueezeAlert.cs` の中身を貼り付けてビルド。ログ書き込みのため `AccessRights.FullAccess` を要求する。出力先は `Documents\cAlgo\Data\`。
 
-**MT5**: `BBSqueezeAlert.mq5` を `MQL5\Indicators\` に置いて MetaEditor でコンパイル。プッシュ通知は ツール → オプション → 通知 で MetaQuotes ID を登録して有効化しておく（無効のままだとエキスパートログに警告を 1 回出す）。ログは `MQL5\Files\<Log_FileName>`。
+**MT5**: `BBSqueezeAlert.mq5` を `MQL5\Indicators\` に置いて MetaEditor でコンパイル。プッシュ通知は ツール → オプション → 通知 で MetaQuotes ID を登録して有効化しておく（無効のままだとエキスパートログに警告を 1 回出す）。出力先は `MQL5\Files\`。
 
-> この環境には cTrader / MetaEditor のコンパイラがないため、C# と MQL5 はビルド未確認。判定ロジックは同じ構造の Python 実装でテストしている。
+出力ファイル名:
+- ログ: `Log_FileName`。空（既定）なら `bb_alert_log_<SYMBOL>_<TF>.csv`（例: `bb_alert_log_GBPJPY_M15.csv`）なので、複数チャートに入れても衝突しない
+- OHLC ダンプ（`Dump_Bars=true` のとき）: `bars_<SYMBOL>_<TF>.csv`
 
-## 一致確認
+ビルド確認状況:
+- C#: .NET 8 SDK + NuGet `cTrader.Automate` 1.0.21（target net6.0）でビルドし、警告 0・エラー 0 を確認。cTrader Automate 本体でのビルドは未確認
+- MQL5: MetaEditor が入手できない環境（ダウンロードがネットワークポリシーで遮断）のためコンパイル未確認
+
+## 実装検証（リファレンスとの完全一致）
+
+ブローカー価格差と実装差を切り分けるため、8 章の一致確認の前に、各実装がリファレンス実装と同じ OHLC で完全一致することを確かめる。
+
+1. `Dump_Bars=true` でインジケータを適用する（初回ロード完了時に確定足の OHLC とログが同じ足の範囲で出る）
+2. ダンプした OHLC をリファレンス実装に通す
+3. `--strict` で比較する。全列一致なら `EXACT MATCH`（終了コード 0）、不一致は実装のバグ
+
+```sh
+python3 tools/bbsq_reference.py bars_GBPJPY_M15.csv -o reference.csv --platform MT5
+python3 tools/compare_logs.py bb_alert_log_GBPJPY_M15.csv reference.csv --strict -o strict.csv
+```
+
+- 両方とも同じ時刻基準で出るので `--ctrader-tz` / `--mt5-tz` は指定しない
+- 比較はダンプ直後に行う（ダンプは初回ロード時の 1 回だけなので、その後に確定した足のシグナルはログにだけ載る）
+- `strict.csv` の `diff_cols` に不一致の列名が出る。列名の `ct_` は 1 つ目の引数、`mt5_` は 2 つ目の引数
+
+## 一致確認（cTrader と MT5）
 
 ```sh
 # 両方のログを同じ日付範囲で比較（MT5 のサーバー時刻が GMT+2/+3 夏時間なら Europe/Athens）
@@ -30,7 +53,7 @@ python3 tools/compare_logs.py ctrader.csv mt5.csv \
 python3 tools/bbsq_reference.py bars.csv -o reference.csv --platform MT5
 ```
 
-`bars.csv` は `time,open,high,low,close`（古い順、確定足のみ）。
+`bars.csv` は `time,open,high,low,close`（古い順、確定足のみ。`Dump_Bars` の出力と同じ形式）。
 
 テスト: `python3 -m unittest discover -s tests`
 
@@ -46,10 +69,10 @@ python3 tools/bbsq_reference.py bars.csv -o reference.csv --platform MT5
 6. **時刻**: cTrader には「サーバー時刻」がないため UTC で出力（`TimeZone = TimeZones.UTC`）。MT5 はサーバー時刻。突き合わせ時に `compare_logs.py` で UTC にそろえる。
 7. **価格の桁数**: 仕様どおり小数 3 桁固定（GBPJPY 前提）。他通貨ペアで使うなら要変更。
 8. **ログの改行**: 両実装とも UTF-8（BOM なし）、CRLF。
+9. **過去足の追加読込（cTrader）**: `Calculate` が評価済みより古い index（最終足以外）で呼ばれたら全足を再計算する。`BBSQ_` で始まるチャートオブジェクトを消し、ログを作り直し、再計算が最終足に届くまで通知しない。MT5 は `prev_calculated == 0` で同じ動きになる。
 
 ## 仕様書への指摘
 
-- **MT5 の iATR は Wilder ではない**: 3 章に「Wilder 方式。MT5 の iATR と同一」とあるが、MT5 標準の ATR は TR の単純移動平均で、Wilder 平滑ではない。本実装は仕様の式（Wilder）で両方とも自前計算しているので一致確認には影響しないが、「iATR と同一」の記述は削除か修正が必要。
 - **BW 分位の同値**: 「BW_i 以下の本数」で数えるため、値動きがほぼ止まって BW が同値の足が並ぶと分位が高く出る（スクイーズと判定されにくい）。実データではまず起きないが、仕様の意図どおりか確認したい。
 - **EMA / ATR の起点依存**: 再帰計算なので、チャートの読み込み開始位置が違うと直後の値がずれる（数十本で収束）。8 章の「両者とも同じ日付から開始」は、比較期間の開始を両方の履歴の先頭から十分後ろ（数百本以上）に置くことで満たす。
 - **再接続時の通知**: 回線断などで複数の足をまとめて評価したときは、確定した足ごとに通知が出る（同じ足の重複は出ない）。

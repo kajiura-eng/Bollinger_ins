@@ -3,7 +3,10 @@
 このファイル 1 本に、仕様書・実装コード・設計判断・既知の論点をすべてまとめています。前提知識なしでレビューできます。
 
 - リポジトリ: kajiura-eng/Bollinger_ins（ブランチ `claude/new-session-m1za20`）
-- 状態: 仕様書 v0.1 に基づく初版実装。C# / MQL5 はコンパイル未確認（コンパイラのない環境で作成）。Python リファレンス実装のテスト 14 件は成功
+- 状態: 仕様書 v0.1（Sep 26 改訂）に基づく実装の第 2 版（過去足の追加読込、ログ名の自動生成、Dump_Bars に対応）
+  - C#: .NET 8 SDK + NuGet `cTrader.Automate` 1.0.21 でビルドし、警告 0・エラー 0（cTrader 本体では未確認）
+  - MQL5: MetaEditor が入手できずコンパイル未確認 → **MQL5 の API 誤用・コンパイルエラーを重点的に見てほしい**
+  - Python リファレンス実装のテスト 14 件は成功
 
 ## レビューしてほしいこと
 
@@ -40,10 +43,12 @@
 9. **ログ**: UTF-8（BOM なし）、CRLF。MQL5 は改行コードを固定するためバイナリで書き込む
 10. **通知の判定**: cTrader は `IsLastBar` に初めて到達するまでを初回ロードとみなす。MT5 は `prev_calculated == 0` の呼び出しを初回ロード・再計算とみなし、ログも作り直す
 11. **パラメータ下限**: Sq_MinBars ≥ 1、BB_Period ≥ 2 など（MT5 は OnInit で INIT_PARAMETERS_INCORRECT）
+12. **過去足の追加読込（cTrader）**: `Calculate(index)` で `index <= _processed && index < Bars.Count - 1` なら全足再計算（`BBSQ_` 前綴のオブジェクト削除、ログ作り直し、`_live=false`）。再計算が最終足に届いたら `_live=true`。MT5 は `prev_calculated == 0` で同じ動き
+13. **ログ名**: `Log_FileName` が空（既定）なら `bb_alert_log_<SYMBOL>_<TF>.csv`。ファイル名に使えない文字は `_` に置換
+14. **Dump_Bars**: 初回ロード（または再計算）完了時に確定足 0..最終確定足の OHLC を `bars_<SYMBOL>_<TF>.csv` へ出力。価格はシンボルの桁数、時刻はログと同じ基準。`compare_logs.py --strict` でリファレンスとの全列一致を確認する
 
 ## 仕様書への指摘（作成者の見解）
 
-- **3 章「MT5 の iATR と同一」は誤り**: MT5 標準 ATR は TR の単純移動平均で Wilder 平滑ではない。実装は両方とも仕様の式（Wilder）で自前計算しているので一致には影響しないが、記述の修正が必要
 - **BW 分位の同値**: 「BW_i 以下の本数」なので同値の BW が並ぶと分位が高く出る（スクイーズ判定されにくい）
 - **EMA / ATR の起点依存**: 再帰計算のため履歴の開始位置で初期の値がずれる。比較期間は両方の履歴の先頭から十分後ろに置く必要がある
 - **再接続時の通知**: 複数の足をまとめて評価したときは足ごとに通知が出る（同じ足の重複はない）
@@ -57,6 +62,8 @@
 # BBスクイーズ・アラートインジケータ 共通仕様書 v0.1
 
 Sep 26, 2026 · @TOSHIKI
+
+改訂（Sep 26, 2026）: ATR 記述の修正、cTrader の時刻は UTC、過去足の追加読込時の再計算、Log_FileName の自動生成、Dump_Bars 追加、実装とリファレンスの完全一致確認手順
 
 ## 1. 目的とスコープ
 
@@ -85,7 +92,8 @@ GBPJPY M15 で、ボリンジャーバンドがスクイーズからエクスパ
 | Break_Mode | enum | Close | Close = 終値がバンド外 / Body = 始値・終値ともバンド外 |
 | Alert_Enabled | bool | true | 通知の ON/OFF |
 | Log_Enabled | bool | true | CSV ログ出力の ON/OFF |
-| Log_FileName | string | bb_alert_log.csv | ログファイル名 |
+| Log_FileName | string | （空） | ログファイル名。空なら bb_alert_log_<SYMBOL>_<TF>.csv を自動生成（複数チャートでの衝突防止） |
+| Dump_Bars | bool | false | true なら初回ロード完了時に確定足の OHLC を bars_<SYMBOL>_<TF>.csv へ出力（8 章の実装検証用） |
 
 実装固有のパラメータ（MT5 の SendNotification 用ID、cTrader の音ファイル）は各実装で追加してよいが、判定に関わるパラメータは本表以外に置かない。
 
@@ -106,14 +114,14 @@ Upper_i = Mid_i + d\,\sigma_i,\quad Lower_i = Mid_i - d\,\sigma_i
 
 n = BB_Period、d = BB_Dev。
 
-**ATR**（Wilder 方式。MT5 の iATR と同一、cTrader 側もこの式で自前計算する）
+**ATR**（Wilder 方式。両実装ともこの式で自前計算する。MT5 標準の iATR は TR の単純移動平均で Wilder ではないため使わない）
 
 ```latex
 TR_i = \max(High_i-Low_i,\ |High_i-Close_{i-1}|,\ |Low_i-Close_{i-1}|),\quad
 ATR_i = \frac{(p-1)\,ATR_{i-1}+TR_i}{p}
 ```
 
-p = KC_AtrPeriod。初期値 ATR は最初の p 本の TR 単純平均。
+p = KC_AtrPeriod。初期値 ATR は最初の p 本の TR 単純平均。足 0 は前の終値がないので TR_0 = High_0 − Low_0。
 
 **Keltner チャネル**
 
@@ -170,7 +178,7 @@ BW パーセンタイル = 直近 Sq_BwLookback 本（足 i を含む）の BW �
 | 評価対象 | 直近確定足 = 形成中の足の1本前 | Calculate(index) で index が最終足なら index-1 を評価 | OnCalculate で rates_total-2 を評価（rates_total-1 は形成中） |
 | 二重通知防止 | 発火足の開始時刻を保持し、同じ時刻なら再通知しない | DateTime lastAlertBar | datetime lastAlertBar（time[] を保持） |
 | 初回ロード抑止 | インジケータ起動時に過去足で通知しない。描画とログは過去足にも行う | 起動時刻より古い足では Notify を呼ばない（IsLastBar 判定） | prev_calculated==0 の一括計算中は通知しない |
-| 再計算 | チャート再読込・パラメータ変更で過去シグナルの描画は再生成、通知は出さない | 同上 | 同上 |
+| 再計算 | チャート再読込・パラメータ変更・過去足の追加読込で、過去シグナルの描画とログは作り直し、通知は出さない | Calculate が評価済みより古い index（最終足以外）で呼ばれたら全足を再計算。"BBSQ_" 前綴のチャートオブジェクトを削除しログを作り直す | prev_calculated==0 で全足を再計算 |
 
 通知は「新しい確定足が生成された瞬間」に1回だけ出る。過去ログとの突き合わせは 7 章の CSV で行う。
 
@@ -191,7 +199,7 @@ cTrader 版はチャート内アラートのみ、MT5 版はスマホへのプ�
 BBSQ GBPJPY M15 DOWN 2026-09-22 16:30 close=210.438 lower=210.463 sqlen=8
 ```
 
-方向は UP / DOWN、時刻は足の開始時刻（サーバー時刻）。sqlen は解除直前の SqLen。MT5 の SendNotification は 255 文字制限があるので、このフォーマットに収める。
+方向は UP / DOWN、時刻は足の開始時刻（MT5 はサーバー時刻、cTrader は UTC）。sqlen は解除直前の SqLen。MT5 の SendNotification は 255 文字制限があるので、このフォーマットに収める。
 
 ## 7. チャート描画とログ
 
@@ -209,10 +217,10 @@ platform,symbol,tf,bar_time,dir,open,close,upper,lower,mid,bw_pct,kc_up,kc_lo,sq
 cTrader,GBPJPY,M15,2026-09-22 16:30,DOWN,210.552,210.438,210.789,210.463,210.626,12.5,210.801,210.451,8,KC
 ```
 
-- bar_time は足の開始時刻（サーバー時刻、YYYY-MM-DD HH:MM）
+- bar_time は足の開始時刻（YYYY-MM-DD HH:MM。MT5 はサーバー時刻、cTrader はサーバー時刻の概念がないため UTC）
 - 価格は小数 3 桁、bw_pct は小数 1 桁
 - sq_mode_hit は解除直前足で成立していた条件（KC / BW / BOTH）
-- 保存先: cTrader は Documents\\cAlgo\\Data 配下、MT5 は MQL5\\Files 配下。ファイル名は Log_FileName
+- 保存先: cTrader は Documents\\cAlgo\\Data 配下、MT5 は MQL5\\Files 配下。ファイル名は Log_FileName（空なら bb_alert_log_<SYMBOL>_<TF>.csv）
 - 初回ロード時の過去足シグナルも同じ形式で書き出す（過去分の突き合わせに使う）。重複防止のため、起動時は過去足分でファイルを作り直し（上書き）、以後の新規シグナルのみ追記する。突き合わせ用に残したい場合は起動前にファイルを退避する
 
 ## 8. プラットフォーム差異と一致確認
@@ -222,9 +230,17 @@ cTrader,GBPJPY,M15,2026-09-22 16:30,DOWN,210.552,210.438,210.789,210.463,210.626
 | 差異の源 | 影響 | 対処 |
 | --- | --- | --- |
 | ブローカーの価格データ（Bid ベース、フィード差） | Close が 0.1〜0.5 pips ずれ、バンド際の足で発火有無が分かれる | 許容。不一致足はログで理由（close と upper/lower の差）を記録して裁量比較の注記にする |
-| サーバー時刻の GMT オフセット | bar_time がずれる | 突き合わせ時にオフセットを補正。M15 の足境界は 15 分単位なので判定自体は影響なし |
+| 時刻の基準（cTrader は UTC、MT5 はサーバー時刻） | bar_time がずれる | 突き合わせ時に両方を UTC に補正（compare_logs.py の --ctrader-tz / --mt5-tz）。M15 の足境界は 15 分単位なので判定自体は影響なし |
 | 週明け・祝日のギャップ足 | 両者で足数が違うと SqLen がずれる | 日足境界ではなく足数で計算しているので、欠損足がある側は SqLen が短くなる。発火不一致の主要因候補として記録 |
 | 過去足の本数 | パーセンタイルの参照窓の起点がずれる | 初回ロード時は Sq_BwLookback + BB_Period 本以降のみ判定。両者とも同じ日付から開始 |
+
+**実装検証（一致確認の前に行う）**
+
+ブローカー価格差と実装差を切り分けるため、先に各実装がリファレンス実装（tools/bbsq_reference.py）と同じ OHLC で完全一致することを確かめる。
+
+1. Dump_Bars=true で各実装をチャートに適用し、bars_<SYMBOL>_<TF>.csv とログ CSV を得る
+2. bars CSV をリファレンス実装に通してログを作る
+3. compare_logs.py --strict で実装ログとリファレンスのログを比較し、全列の完全一致を確認する（不一致は実装のバグ）
 
 **一致確認手順**
 
@@ -251,12 +267,16 @@ cTrader,GBPJPY,M15,2026-09-22 16:30,DOWN,210.552,210.438,210.789,210.463,210.626
 // - 判定は確定足のみ。Calculate(index) で index-1（直近確定足）までを 1 回ずつ評価する
 // - BB / EMA / ATR / BandWidth 分位はすべて自前計算（組込指標は使わない）
 // - 通知はチャート内テキスト + 音のみ。起動時の過去足では通知しない（描画とログは行う）
-// - ログ CSV は Documents\cAlgo\Data\<Log_FileName>。起動時に作り直し、以後は追記
+// - ログ CSV は Documents\cAlgo\Data\<Log_FileName>（空なら bb_alert_log_<SYMBOL>_<TF>.csv）。
+//   起動時と過去足の追加読込時に作り直し、以後は追記
+// - 過去足の追加読込（Calculate が古い index で呼び直される）では描画・ログを作り直し、通知は出さない
+// - Dump_Bars=true なら初回ロード完了時に確定足の OHLC を bars_<SYMBOL>_<TF>.csv へ出力（bbsq_reference.py の入力）
 // - 足の時刻は UTC（TimeZone = TimeZones.UTC）。MT5 ログとの突き合わせは tools/compare_logs.py で補正する
 
 using System;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using cAlgo.API;
 
@@ -316,12 +336,15 @@ namespace cAlgo
         [Parameter("Log_Enabled", DefaultValue = true, Group = "Output")]
         public bool Log_Enabled { get; set; }
 
-        [Parameter("Log_FileName", DefaultValue = "bb_alert_log.csv", Group = "Output")]
+        [Parameter("Log_FileName", DefaultValue = "", Group = "Output")]
         public string Log_FileName { get; set; }
 
         // ---- 実装固有パラメータ（判定には関与しない） ----
         [Parameter("Sound_File", DefaultValue = "", Group = "Output")]
         public string Sound_File { get; set; }
+
+        [Parameter("Dump_Bars", DefaultValue = false, Group = "Output")]
+        public bool Dump_Bars { get; set; }
 
         [Parameter("Show_Keltner", DefaultValue = false, Group = "Display")]
         public bool Show_Keltner { get; set; }
@@ -360,8 +383,11 @@ namespace cAlgo
         private int _processed = -1;          // 評価済みの最後の確定足
         private bool _live;                   // 初回ロード完了後のみ通知する
         private DateTime _lastAlertBar = DateTime.MinValue;
+        private string _dataDir;
         private string _logPath;
         private string _tf;
+
+        private const string ObjPrefix = "BBSQ_";
 
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         private const string CsvHeader =
@@ -378,27 +404,23 @@ namespace cAlgo
             _sqLen = CreateDataSeries();
 
             _tf = TimeFrameLabel(TimeFrame);
+            _dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "cAlgo", "Data");
+            string logName = string.IsNullOrWhiteSpace(Log_FileName)
+                ? "bb_alert_log_" + SymbolName + "_" + _tf + ".csv"
+                : Log_FileName;
+            _logPath = Path.Combine(_dataDir, SafeFileName(logName));
 
-            if (Log_Enabled)
-            {
-                try
-                {
-                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "cAlgo", "Data");
-                    Directory.CreateDirectory(dir);
-                    _logPath = Path.Combine(dir, Log_FileName);
-                    // 起動時は作り直す（過去足分をこの後書き出す）
-                    File.WriteAllText(_logPath, CsvHeader + Environment.NewLine, new UTF8Encoding(false));
-                }
-                catch (Exception ex)
-                {
-                    Print("BBSQ: log file init failed: " + ex.Message);
-                    _logPath = null;
-                }
-            }
+            // 起動時は作り直す（過去足分をこの後書き出す）
+            ResetLog();
         }
 
         public override void Calculate(int index)
         {
+            // 過去足の追加読込: 評価済みより古い index から呼び直される -> 全足を再計算する
+            // （最終足の tick ごとの呼び出しは index > _processed なので該当しない）
+            if (index <= _processed && index < Bars.Count - 1)
+                ResetForRecalc();
+
             // 形成中の足（index）は判定・描画しない。index-1 までの確定足を 1 本ずつ評価する
             int lastClosed = index - 1;
             while (_processed < lastClosed)
@@ -407,9 +429,81 @@ namespace cAlgo
                 Process(_processed);
             }
 
-            // 最終足に到達した時点で初回ロード完了。以後に確定した足だけ通知する
             if (IsLastBar)
-                _live = true;
+            {
+                ClearOutputs(index);
+                // 最終足に到達した時点で初回ロード（または再計算）完了。以後に確定した足だけ通知する
+                if (!_live)
+                {
+                    _live = true;
+                    if (Dump_Bars)
+                        DumpBars(lastClosed);
+                }
+            }
+        }
+
+        private void ResetForRecalc()
+        {
+            _processed = -1;
+            _live = false;
+            foreach (var obj in Chart.Objects.Where(o => o.Name.StartsWith(ObjPrefix, StringComparison.Ordinal)).ToArray())
+                Chart.RemoveObject(obj.Name);
+            ResetLog();
+        }
+
+        private void ResetLog()
+        {
+            if (!Log_Enabled || _logPath == null)
+                return;
+            try
+            {
+                Directory.CreateDirectory(_dataDir);
+                System.IO.File.WriteAllText(_logPath, CsvHeader + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Print("BBSQ: log file init failed: " + ex.Message);
+                _logPath = null;
+            }
+        }
+
+        // 確定足 0..lastClosed の OHLC を bbsq_reference.py の入力形式で書き出す
+        private void DumpBars(int lastClosed)
+        {
+            string path = Path.Combine(_dataDir, SafeFileName("bars_" + SymbolName + "_" + _tf + ".csv"));
+            string fmt = "F" + Symbol.Digits.ToString(Inv);
+            try
+            {
+                Directory.CreateDirectory(_dataDir);
+                var sb = new StringBuilder();
+                sb.Append("time,open,high,low,close").Append(Environment.NewLine);
+                for (int i = 0; i <= lastClosed; i++)
+                {
+                    sb.Append(Bars.OpenTimes[i].ToString("yyyy-MM-dd HH:mm", Inv)).Append(',')
+                      .Append(Bars.OpenPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.HighPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.LowPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.ClosePrices[i].ToString(fmt, Inv)).Append(Environment.NewLine);
+                }
+                System.IO.File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                Print("BBSQ: dumped " + (lastClosed + 1) + " bars to " + path);
+            }
+            catch (Exception ex)
+            {
+                Print("BBSQ: bar dump failed: " + ex.Message);
+            }
+        }
+
+        // 形成中の足には何も描かない
+        private void ClearOutputs(int i)
+        {
+            Upper[i] = double.NaN;
+            Mid[i] = double.NaN;
+            Lower[i] = double.NaN;
+            KcUpper[i] = double.NaN;
+            KcLower[i] = double.NaN;
+            SqDotWeak[i] = double.NaN;
+            SqDotStrong[i] = double.NaN;
         }
 
         private void Process(int i)
@@ -534,12 +628,12 @@ namespace cAlgo
 
             // 矢印
             if (dir == "UP")
-                Chart.DrawIcon("BBSQ_" + t.Ticks, ChartIconType.UpArrow, t, Bars.HighPrices[i] + 0.3 * atr, Color.LimeGreen);
+                Chart.DrawIcon(ObjPrefix + t.Ticks, ChartIconType.UpArrow, t, Bars.HighPrices[i] + 0.3 * atr, Color.LimeGreen);
             else
-                Chart.DrawIcon("BBSQ_" + t.Ticks, ChartIconType.DownArrow, t, Bars.LowPrices[i] - 0.3 * atr, Color.Red);
+                Chart.DrawIcon(ObjPrefix + t.Ticks, ChartIconType.DownArrow, t, Bars.LowPrices[i] - 0.3 * atr, Color.Red);
 
             // ログ（過去足も書く）
-            if (_logPath != null)
+            if (Log_Enabled && _logPath != null)
             {
                 string row = string.Join(",",
                     "cTrader", SymbolName, _tf, t.ToString("yyyy-MM-dd HH:mm", Inv), dir,
@@ -547,7 +641,7 @@ namespace cAlgo
                     F3(kcUp), F3(kcLo), prevLen.ToString(Inv), hit);
                 try
                 {
-                    File.AppendAllText(_logPath, row + Environment.NewLine, new UTF8Encoding(false));
+                    System.IO.File.AppendAllText(_logPath, row + Environment.NewLine, new UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -564,7 +658,7 @@ namespace cAlgo
                 SymbolName, _tf, dir, t.ToString("yyyy-MM-dd HH:mm", Inv), F3(c),
                 dir == "UP" ? "upper" : "lower", F3(dir == "UP" ? upper : lower), prevLen);
             Print(msg);
-            Chart.DrawStaticText("BBSQ_msg", msg, VerticalAlignment.Top, HorizontalAlignment.Left,
+            Chart.DrawStaticText(ObjPrefix + "msg", msg, VerticalAlignment.Top, HorizontalAlignment.Left,
                 dir == "UP" ? Color.LimeGreen : Color.Red);
             if (!string.IsNullOrEmpty(Sound_File))
                 Notifications.PlaySound(Sound_File);
@@ -596,6 +690,13 @@ namespace cAlgo
             if (kcHit) return "KC";
             if (bwHit) return "BW";
             return "";
+        }
+
+        private static string SafeFileName(string name)
+        {
+            foreach (char ch in Path.GetInvalidFileNameChars())
+                name = name.Replace(ch, '_');
+            return name;
         }
 
         private static string F3(double v)
@@ -644,8 +745,11 @@ namespace cAlgo
 //| - BB / EMA / ATR / BandWidth 分位はすべて自前計算                |
 //| - 通知は SendNotification（スマホ push）のみ                     |
 //|   prev_calculated==0 の一括計算中は通知しない（描画とログは行う）|
-//| - ログ CSV は MQL5\Files\<Log_FileName>。一括計算時に作り直し、  |
-//|   以後は追記。bar_time はサーバー時刻                            |
+//| - ログ CSV は MQL5\Files\<Log_FileName>（空なら                   |
+//|   bb_alert_log_<SYMBOL>_<TF>.csv）。一括計算時に作り直し、以後は  |
+//|   追記。bar_time はサーバー時刻                                  |
+//| - Dump_Bars=true なら一括計算の完了時に確定足の OHLC を           |
+//|   bars_<SYMBOL>_<TF>.csv へ出力（bbsq_reference.py の入力）      |
 //+------------------------------------------------------------------+
 #property copyright "BB squeeze alert"
 #property version   "0.10"
@@ -712,7 +816,8 @@ input double          Sq_BwPct      = 20.0;
 input ENUM_BREAK_MODE Break_Mode    = BREAK_CLOSE;
 input bool            Alert_Enabled = true;
 input bool            Log_Enabled   = true;
-input string          Log_FileName  = "bb_alert_log.csv";
+input string          Log_FileName  = "";
+input bool            Dump_Bars     = false;
 //---- 実装固有パラメータ（判定には関与しない）
 input bool            Show_Keltner  = false;
 
@@ -740,6 +845,7 @@ int      g_warm         = 0;    // 判定を始める最初の足
 datetime g_lastAlertBar = 0;
 string   g_tf           = "";
 bool     g_warnedNotify = false;
+string   g_logName      = "";
 
 #define CSV_HEADER "platform,symbol,tf,bar_time,dir,open,close,upper,lower,mid,bw_pct,kc_up,kc_lo,sqlen,sq_mode_hit"
 
@@ -786,6 +892,12 @@ int OnInit()
    g_warm = MathMax(BB_Period + Sq_BwLookback, MathMax(KC_Period, KC_AtrPeriod));
    g_tf = StringSubstr(EnumToString((ENUM_TIMEFRAMES)_Period), 7); // "PERIOD_M15" -> "M15"
    g_processed = -1;
+   string logName = Log_FileName;
+   StringTrimLeft(logName);
+   StringTrimRight(logName);
+   if(logName == "")
+      logName = "bb_alert_log_" + _Symbol + "_" + g_tf + ".csv";
+   g_logName = SafeFileName(logName);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "BBSQ(" + (string)BB_Period + "," + DoubleToString(BB_Dev, 1) + ")");
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
@@ -830,6 +942,9 @@ int OnCalculate(const int rates_total,
       g_processed++;
       Process(g_processed, !initial, time, open, high, low, close);
      }
+
+   if(initial && Dump_Bars)
+      DumpBars(lastClosed, time, open, high, low, close);
 
    // 形成中の足は描画しない
    ClearPlots(rates_total - 1, rates_total - 1);
@@ -1041,6 +1156,34 @@ string HitLabel(const bool kcHit, const bool bwHit)
    return("");
   }
 
+string SafeFileName(string name)
+  {
+   string bad = "\\/:*?\"<>|";
+   for(int k = 0; k < StringLen(bad); k++)
+      StringReplace(name, StringSubstr(bad, k, 1), "_");
+   return(name);
+  }
+
+//---- 確定足 0..lastClosed の OHLC を bbsq_reference.py の入力形式で書き出す
+void DumpBars(const int lastClosed, const datetime &time[], const double &open[],
+              const double &high[], const double &low[], const double &close[])
+  {
+   string name = SafeFileName("bars_" + _Symbol + "_" + g_tf + ".csv");
+   int h = FileOpen(name, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   if(h == INVALID_HANDLE)
+     {
+      Print("BBSQ: bar dump failed, error ", GetLastError());
+      return;
+     }
+   WriteLine(h, "time,open,high,low,close");
+   for(int i = 0; i <= lastClosed; i++)
+      WriteLine(h, BarTime(time[i]) + "," + DoubleToString(open[i], _Digits) + "," +
+                DoubleToString(high[i], _Digits) + "," + DoubleToString(low[i], _Digits) + "," +
+                DoubleToString(close[i], _Digits));
+   FileClose(h);
+   PrintFormat("BBSQ: dumped %d bars to %s", lastClosed + 1, name);
+  }
+
 string F3(const double v)
   {
    return(DoubleToString(v, 3));
@@ -1075,13 +1218,13 @@ void WriteLine(const int h, const string line)
   {
    uchar buf[];
    int len = StringToCharArray(line + "\r\n", buf, 0, WHOLE_ARRAY, CP_UTF8) - 1; // 終端 NUL を除く
-   if(len > 0)
-      FileWriteArray(h, buf, 0, len);
+   if(len > 0 && FileWriteArray(h, buf, 0, len) != (uint)len)
+      Print("BBSQ: file write failed, error ", GetLastError());
   }
 
 void LogReset()
   {
-   int h = FileOpen(Log_FileName, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   int h = FileOpen(g_logName, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(h == INVALID_HANDLE)
      {
       Print("BBSQ: log file init failed, error ", GetLastError());
@@ -1093,13 +1236,14 @@ void LogReset()
 
 void LogAppend(const string row)
   {
-   int h = FileOpen(Log_FileName, FILE_READ | FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   int h = FileOpen(g_logName, FILE_READ | FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(h == INVALID_HANDLE)
      {
       Print("BBSQ: log write failed, error ", GetLastError());
       return;
      }
-   FileSeek(h, 0, SEEK_END);
+   if(!FileSeek(h, 0, SEEK_END))
+      Print("BBSQ: file seek failed, error ", GetLastError());
    WriteLine(h, row);
    FileClose(h);
   }
@@ -1466,6 +1610,11 @@ bar_time を各プラットフォームのタイムゾーンから UTC に直し
       --ctrader-tz UTC --mt5-tz Europe/Athens --from 2026-06-26 --to 2026-09-26 \
       -o compare_result.csv
 
+実装とリファレンス実装の完全一致確認（同じ OHLC から出したログ同士）には --strict を付ける。
+(bar_time, dir) の一致に加えて価格・bw_pct・sqlen・sq_mode_hit の全列が一致しない足を value_diff とし、
+1 件でも不一致があれば終了コード 1 を返す:
+  python3 tools/compare_logs.py mt5_log.csv reference.csv --strict
+
 タイムゾーンは IANA 名（例: UTC, Europe/Athens, Asia/Tokyo）か固定オフセット（例: +02:00）で指定する。
 MT5 ブローカーのサーバー時刻は「GMT+2 / 夏時間 GMT+3」が多く、これは Europe/Athens と同じ動きになる。
 """
@@ -1481,6 +1630,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 TIME_FMT = "%Y-%m-%d %H:%M"
+VALUE_COLUMNS = ("open", "close", "upper", "lower", "mid", "bw_pct", "kc_up", "kc_lo", "sqlen", "sq_mode_hit")
 
 
 def parse_tz(spec: str) -> tzinfo:
@@ -1523,6 +1673,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--to", dest="date_to", help="比較終了日（UTC、YYYY-MM-DD、含む）")
     ap.add_argument("--pip", type=float, default=0.01, help="1 pip の価格幅（GBPJPY は 0.01）")
     ap.add_argument("--pass-rate", type=float, default=90.0, help="合格ライン（%%）")
+    ap.add_argument("--strict", action="store_true",
+                    help="一致した足の全値列も比較し、1 件でも不一致なら終了コード 1（実装とリファレンスの比較用）")
     ap.add_argument("-o", "--output", help="分類結果 CSV の出力先")
     a = ap.parse_args(argv)
 
@@ -1541,12 +1693,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     keys = sorted(k for k in set(ct) | set(mt) if in_range(k[0]))
     out_rows = []
-    counts = {"match": 0, "ctrader_only": 0, "mt5_only": 0}
+    counts = {"match": 0, "value_diff": 0, "ctrader_only": 0, "mt5_only": 0}
     for key in keys:
         t, d = key
         c, m = ct.get(key), mt.get(key)
+        diff_cols = ""
         if c and m:
             status = "match"
+            if a.strict:
+                diffs = [col for col in VALUE_COLUMNS if c[col] != m[col]]
+                if diffs:
+                    status = "value_diff"
+                    diff_cols = " ".join(diffs)
         elif c:
             status = "ctrader_only"
         else:
@@ -1565,6 +1723,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "mt5_gap_pips": f"{band_gap_pips(m, a.pip):.1f}" if m else "",
                 "mt5_sqlen": m["sqlen"] if m else "",
                 "mt5_hit": m["sq_mode_hit"] if m else "",
+                **({"diff_cols": diff_cols} if a.strict else {}),
             }
         )
 
@@ -1578,9 +1737,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     rate = counts["match"] * 100.0 / total if total else 0.0
     print(f"signals (union): {total}")
     print(f"  match        : {counts['match']}")
+    if a.strict:
+        print(f"  value diff   : {counts['value_diff']}")
     print(f"  cTrader only : {counts['ctrader_only']}")
     print(f"  MT5 only     : {counts['mt5_only']}")
     print(f"match rate     : {rate:.1f}% (pass line {a.pass_rate:.0f}%) -> {'PASS' if rate >= a.pass_rate else 'FAIL'}")
+    if a.strict:
+        exact = counts["match"] == total
+        print(f"strict         : {'EXACT MATCH' if exact else 'MISMATCH'}")
+        return 0 if exact else 1
     print("片側のみの足: gap_pips が小さい（数 pips 未満）なら価格差、sqlen が Sq_MinBars 付近なら SqLen 差を疑う")
     return 0
 

@@ -4,12 +4,16 @@
 // - 判定は確定足のみ。Calculate(index) で index-1（直近確定足）までを 1 回ずつ評価する
 // - BB / EMA / ATR / BandWidth 分位はすべて自前計算（組込指標は使わない）
 // - 通知はチャート内テキスト + 音のみ。起動時の過去足では通知しない（描画とログは行う）
-// - ログ CSV は Documents\cAlgo\Data\<Log_FileName>。起動時に作り直し、以後は追記
+// - ログ CSV は Documents\cAlgo\Data\<Log_FileName>（空なら bb_alert_log_<SYMBOL>_<TF>.csv）。
+//   起動時と過去足の追加読込時に作り直し、以後は追記
+// - 過去足の追加読込（Calculate が古い index で呼び直される）では描画・ログを作り直し、通知は出さない
+// - Dump_Bars=true なら初回ロード完了時に確定足の OHLC を bars_<SYMBOL>_<TF>.csv へ出力（bbsq_reference.py の入力）
 // - 足の時刻は UTC（TimeZone = TimeZones.UTC）。MT5 ログとの突き合わせは tools/compare_logs.py で補正する
 
 using System;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using cAlgo.API;
 
@@ -69,12 +73,15 @@ namespace cAlgo
         [Parameter("Log_Enabled", DefaultValue = true, Group = "Output")]
         public bool Log_Enabled { get; set; }
 
-        [Parameter("Log_FileName", DefaultValue = "bb_alert_log.csv", Group = "Output")]
+        [Parameter("Log_FileName", DefaultValue = "", Group = "Output")]
         public string Log_FileName { get; set; }
 
         // ---- 実装固有パラメータ（判定には関与しない） ----
         [Parameter("Sound_File", DefaultValue = "", Group = "Output")]
         public string Sound_File { get; set; }
+
+        [Parameter("Dump_Bars", DefaultValue = false, Group = "Output")]
+        public bool Dump_Bars { get; set; }
 
         [Parameter("Show_Keltner", DefaultValue = false, Group = "Display")]
         public bool Show_Keltner { get; set; }
@@ -113,8 +120,11 @@ namespace cAlgo
         private int _processed = -1;          // 評価済みの最後の確定足
         private bool _live;                   // 初回ロード完了後のみ通知する
         private DateTime _lastAlertBar = DateTime.MinValue;
+        private string _dataDir;
         private string _logPath;
         private string _tf;
+
+        private const string ObjPrefix = "BBSQ_";
 
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
         private const string CsvHeader =
@@ -131,27 +141,23 @@ namespace cAlgo
             _sqLen = CreateDataSeries();
 
             _tf = TimeFrameLabel(TimeFrame);
+            _dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "cAlgo", "Data");
+            string logName = string.IsNullOrWhiteSpace(Log_FileName)
+                ? "bb_alert_log_" + SymbolName + "_" + _tf + ".csv"
+                : Log_FileName;
+            _logPath = Path.Combine(_dataDir, SafeFileName(logName));
 
-            if (Log_Enabled)
-            {
-                try
-                {
-                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "cAlgo", "Data");
-                    Directory.CreateDirectory(dir);
-                    _logPath = Path.Combine(dir, Log_FileName);
-                    // 起動時は作り直す（過去足分をこの後書き出す）
-                    File.WriteAllText(_logPath, CsvHeader + Environment.NewLine, new UTF8Encoding(false));
-                }
-                catch (Exception ex)
-                {
-                    Print("BBSQ: log file init failed: " + ex.Message);
-                    _logPath = null;
-                }
-            }
+            // 起動時は作り直す（過去足分をこの後書き出す）
+            ResetLog();
         }
 
         public override void Calculate(int index)
         {
+            // 過去足の追加読込: 評価済みより古い index から呼び直される -> 全足を再計算する
+            // （最終足の tick ごとの呼び出しは index > _processed なので該当しない）
+            if (index <= _processed && index < Bars.Count - 1)
+                ResetForRecalc();
+
             // 形成中の足（index）は判定・描画しない。index-1 までの確定足を 1 本ずつ評価する
             int lastClosed = index - 1;
             while (_processed < lastClosed)
@@ -160,9 +166,81 @@ namespace cAlgo
                 Process(_processed);
             }
 
-            // 最終足に到達した時点で初回ロード完了。以後に確定した足だけ通知する
             if (IsLastBar)
-                _live = true;
+            {
+                ClearOutputs(index);
+                // 最終足に到達した時点で初回ロード（または再計算）完了。以後に確定した足だけ通知する
+                if (!_live)
+                {
+                    _live = true;
+                    if (Dump_Bars)
+                        DumpBars(lastClosed);
+                }
+            }
+        }
+
+        private void ResetForRecalc()
+        {
+            _processed = -1;
+            _live = false;
+            foreach (var obj in Chart.Objects.Where(o => o.Name.StartsWith(ObjPrefix, StringComparison.Ordinal)).ToArray())
+                Chart.RemoveObject(obj.Name);
+            ResetLog();
+        }
+
+        private void ResetLog()
+        {
+            if (!Log_Enabled || _logPath == null)
+                return;
+            try
+            {
+                Directory.CreateDirectory(_dataDir);
+                System.IO.File.WriteAllText(_logPath, CsvHeader + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Print("BBSQ: log file init failed: " + ex.Message);
+                _logPath = null;
+            }
+        }
+
+        // 確定足 0..lastClosed の OHLC を bbsq_reference.py の入力形式で書き出す
+        private void DumpBars(int lastClosed)
+        {
+            string path = Path.Combine(_dataDir, SafeFileName("bars_" + SymbolName + "_" + _tf + ".csv"));
+            string fmt = "F" + Symbol.Digits.ToString(Inv);
+            try
+            {
+                Directory.CreateDirectory(_dataDir);
+                var sb = new StringBuilder();
+                sb.Append("time,open,high,low,close").Append(Environment.NewLine);
+                for (int i = 0; i <= lastClosed; i++)
+                {
+                    sb.Append(Bars.OpenTimes[i].ToString("yyyy-MM-dd HH:mm", Inv)).Append(',')
+                      .Append(Bars.OpenPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.HighPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.LowPrices[i].ToString(fmt, Inv)).Append(',')
+                      .Append(Bars.ClosePrices[i].ToString(fmt, Inv)).Append(Environment.NewLine);
+                }
+                System.IO.File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                Print("BBSQ: dumped " + (lastClosed + 1) + " bars to " + path);
+            }
+            catch (Exception ex)
+            {
+                Print("BBSQ: bar dump failed: " + ex.Message);
+            }
+        }
+
+        // 形成中の足には何も描かない
+        private void ClearOutputs(int i)
+        {
+            Upper[i] = double.NaN;
+            Mid[i] = double.NaN;
+            Lower[i] = double.NaN;
+            KcUpper[i] = double.NaN;
+            KcLower[i] = double.NaN;
+            SqDotWeak[i] = double.NaN;
+            SqDotStrong[i] = double.NaN;
         }
 
         private void Process(int i)
@@ -287,12 +365,12 @@ namespace cAlgo
 
             // 矢印
             if (dir == "UP")
-                Chart.DrawIcon("BBSQ_" + t.Ticks, ChartIconType.UpArrow, t, Bars.HighPrices[i] + 0.3 * atr, Color.LimeGreen);
+                Chart.DrawIcon(ObjPrefix + t.Ticks, ChartIconType.UpArrow, t, Bars.HighPrices[i] + 0.3 * atr, Color.LimeGreen);
             else
-                Chart.DrawIcon("BBSQ_" + t.Ticks, ChartIconType.DownArrow, t, Bars.LowPrices[i] - 0.3 * atr, Color.Red);
+                Chart.DrawIcon(ObjPrefix + t.Ticks, ChartIconType.DownArrow, t, Bars.LowPrices[i] - 0.3 * atr, Color.Red);
 
             // ログ（過去足も書く）
-            if (_logPath != null)
+            if (Log_Enabled && _logPath != null)
             {
                 string row = string.Join(",",
                     "cTrader", SymbolName, _tf, t.ToString("yyyy-MM-dd HH:mm", Inv), dir,
@@ -300,7 +378,7 @@ namespace cAlgo
                     F3(kcUp), F3(kcLo), prevLen.ToString(Inv), hit);
                 try
                 {
-                    File.AppendAllText(_logPath, row + Environment.NewLine, new UTF8Encoding(false));
+                    System.IO.File.AppendAllText(_logPath, row + Environment.NewLine, new UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -317,7 +395,7 @@ namespace cAlgo
                 SymbolName, _tf, dir, t.ToString("yyyy-MM-dd HH:mm", Inv), F3(c),
                 dir == "UP" ? "upper" : "lower", F3(dir == "UP" ? upper : lower), prevLen);
             Print(msg);
-            Chart.DrawStaticText("BBSQ_msg", msg, VerticalAlignment.Top, HorizontalAlignment.Left,
+            Chart.DrawStaticText(ObjPrefix + "msg", msg, VerticalAlignment.Top, HorizontalAlignment.Left,
                 dir == "UP" ? Color.LimeGreen : Color.Red);
             if (!string.IsNullOrEmpty(Sound_File))
                 Notifications.PlaySound(Sound_File);
@@ -349,6 +427,13 @@ namespace cAlgo
             if (kcHit) return "KC";
             if (bwHit) return "BW";
             return "";
+        }
+
+        private static string SafeFileName(string name)
+        {
+            foreach (char ch in Path.GetInvalidFileNameChars())
+                name = name.Replace(ch, '_');
+            return name;
         }
 
         private static string F3(double v)

@@ -2,6 +2,8 @@
 
 Sep 26, 2026 · @TOSHIKI
 
+改訂（Sep 26, 2026）: ATR 記述の修正、cTrader の時刻は UTC、過去足の追加読込時の再計算、Log_FileName の自動生成、Dump_Bars 追加、実装とリファレンスの完全一致確認手順
+
 ## 1. 目的とスコープ
 
 GBPJPY M15 で、ボリンジャーバンドがスクイーズからエクスパンションに切り替わった直後の足が終値で2σ線を抜けたとき、cTrader 版と MT5 版が**同じ足で同じ方向**に発火する裁量補助インジケータを2本作る。両口座で裁量比較を行うため、判定ロジックは本書を唯一の正とし、両実装は本書から独立に書き起こす。
@@ -29,7 +31,8 @@ GBPJPY M15 で、ボリンジャーバンドがスクイーズからエクスパ
 | Break_Mode | enum | Close | Close = 終値がバンド外 / Body = 始値・終値ともバンド外 |
 | Alert_Enabled | bool | true | 通知の ON/OFF |
 | Log_Enabled | bool | true | CSV ログ出力の ON/OFF |
-| Log_FileName | string | bb_alert_log.csv | ログファイル名 |
+| Log_FileName | string | （空） | ログファイル名。空なら bb_alert_log_<SYMBOL>_<TF>.csv を自動生成（複数チャートでの衝突防止） |
+| Dump_Bars | bool | false | true なら初回ロード完了時に確定足の OHLC を bars_<SYMBOL>_<TF>.csv へ出力（8 章の実装検証用） |
 
 実装固有のパラメータ（MT5 の SendNotification 用ID、cTrader の音ファイル）は各実装で追加してよいが、判定に関わるパラメータは本表以外に置かない。
 
@@ -50,14 +53,14 @@ Upper_i = Mid_i + d\,\sigma_i,\quad Lower_i = Mid_i - d\,\sigma_i
 
 n = BB_Period、d = BB_Dev。
 
-**ATR**（Wilder 方式。MT5 の iATR と同一、cTrader 側もこの式で自前計算する）
+**ATR**（Wilder 方式。両実装ともこの式で自前計算する。MT5 標準の iATR は TR の単純移動平均で Wilder ではないため使わない）
 
 ```latex
 TR_i = \max(High_i-Low_i,\ |High_i-Close_{i-1}|,\ |Low_i-Close_{i-1}|),\quad
 ATR_i = \frac{(p-1)\,ATR_{i-1}+TR_i}{p}
 ```
 
-p = KC_AtrPeriod。初期値 ATR は最初の p 本の TR 単純平均。
+p = KC_AtrPeriod。初期値 ATR は最初の p 本の TR 単純平均。足 0 は前の終値がないので TR_0 = High_0 − Low_0。
 
 **Keltner チャネル**
 
@@ -114,7 +117,7 @@ BW パーセンタイル = 直近 Sq_BwLookback 本（足 i を含む）の BW �
 | 評価対象 | 直近確定足 = 形成中の足の1本前 | Calculate(index) で index が最終足なら index-1 を評価 | OnCalculate で rates_total-2 を評価（rates_total-1 は形成中） |
 | 二重通知防止 | 発火足の開始時刻を保持し、同じ時刻なら再通知しない | DateTime lastAlertBar | datetime lastAlertBar（time[] を保持） |
 | 初回ロード抑止 | インジケータ起動時に過去足で通知しない。描画とログは過去足にも行う | 起動時刻より古い足では Notify を呼ばない（IsLastBar 判定） | prev_calculated==0 の一括計算中は通知しない |
-| 再計算 | チャート再読込・パラメータ変更で過去シグナルの描画は再生成、通知は出さない | 同上 | 同上 |
+| 再計算 | チャート再読込・パラメータ変更・過去足の追加読込で、過去シグナルの描画とログは作り直し、通知は出さない | Calculate が評価済みより古い index（最終足以外）で呼ばれたら全足を再計算。"BBSQ_" 前綴のチャートオブジェクトを削除しログを作り直す | prev_calculated==0 で全足を再計算 |
 
 通知は「新しい確定足が生成された瞬間」に1回だけ出る。過去ログとの突き合わせは 7 章の CSV で行う。
 
@@ -135,7 +138,7 @@ cTrader 版はチャート内アラートのみ、MT5 版はスマホへのプ�
 BBSQ GBPJPY M15 DOWN 2026-09-22 16:30 close=210.438 lower=210.463 sqlen=8
 ```
 
-方向は UP / DOWN、時刻は足の開始時刻（サーバー時刻）。sqlen は解除直前の SqLen。MT5 の SendNotification は 255 文字制限があるので、このフォーマットに収める。
+方向は UP / DOWN、時刻は足の開始時刻（MT5 はサーバー時刻、cTrader は UTC）。sqlen は解除直前の SqLen。MT5 の SendNotification は 255 文字制限があるので、このフォーマットに収める。
 
 ## 7. チャート描画とログ
 
@@ -153,10 +156,10 @@ platform,symbol,tf,bar_time,dir,open,close,upper,lower,mid,bw_pct,kc_up,kc_lo,sq
 cTrader,GBPJPY,M15,2026-09-22 16:30,DOWN,210.552,210.438,210.789,210.463,210.626,12.5,210.801,210.451,8,KC
 ```
 
-- bar_time は足の開始時刻（サーバー時刻、YYYY-MM-DD HH:MM）
+- bar_time は足の開始時刻（YYYY-MM-DD HH:MM。MT5 はサーバー時刻、cTrader はサーバー時刻の概念がないため UTC）
 - 価格は小数 3 桁、bw_pct は小数 1 桁
 - sq_mode_hit は解除直前足で成立していた条件（KC / BW / BOTH）
-- 保存先: cTrader は Documents\\cAlgo\\Data 配下、MT5 は MQL5\\Files 配下。ファイル名は Log_FileName
+- 保存先: cTrader は Documents\\cAlgo\\Data 配下、MT5 は MQL5\\Files 配下。ファイル名は Log_FileName（空なら bb_alert_log_<SYMBOL>_<TF>.csv）
 - 初回ロード時の過去足シグナルも同じ形式で書き出す（過去分の突き合わせに使う）。重複防止のため、起動時は過去足分でファイルを作り直し（上書き）、以後の新規シグナルのみ追記する。突き合わせ用に残したい場合は起動前にファイルを退避する
 
 ## 8. プラットフォーム差異と一致確認
@@ -166,9 +169,17 @@ cTrader,GBPJPY,M15,2026-09-22 16:30,DOWN,210.552,210.438,210.789,210.463,210.626
 | 差異の源 | 影響 | 対処 |
 | --- | --- | --- |
 | ブローカーの価格データ（Bid ベース、フィード差） | Close が 0.1〜0.5 pips ずれ、バンド際の足で発火有無が分かれる | 許容。不一致足はログで理由（close と upper/lower の差）を記録して裁量比較の注記にする |
-| サーバー時刻の GMT オフセット | bar_time がずれる | 突き合わせ時にオフセットを補正。M15 の足境界は 15 分単位なので判定自体は影響なし |
+| 時刻の基準（cTrader は UTC、MT5 はサーバー時刻） | bar_time がずれる | 突き合わせ時に両方を UTC に補正（compare_logs.py の --ctrader-tz / --mt5-tz）。M15 の足境界は 15 分単位なので判定自体は影響なし |
 | 週明け・祝日のギャップ足 | 両者で足数が違うと SqLen がずれる | 日足境界ではなく足数で計算しているので、欠損足がある側は SqLen が短くなる。発火不一致の主要因候補として記録 |
 | 過去足の本数 | パーセンタイルの参照窓の起点がずれる | 初回ロード時は Sq_BwLookback + BB_Period 本以降のみ判定。両者とも同じ日付から開始 |
+
+**実装検証（一致確認の前に行う）**
+
+ブローカー価格差と実装差を切り分けるため、先に各実装がリファレンス実装（tools/bbsq_reference.py）と同じ OHLC で完全一致することを確かめる。
+
+1. Dump_Bars=true で各実装をチャートに適用し、bars_<SYMBOL>_<TF>.csv とログ CSV を得る
+2. bars CSV をリファレンス実装に通してログを作る
+3. compare_logs.py --strict で実装ログとリファレンスのログを比較し、全列の完全一致を確認する（不一致は実装のバグ）
 
 **一致確認手順**
 

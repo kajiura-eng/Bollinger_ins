@@ -7,8 +7,11 @@
 //| - BB / EMA / ATR / BandWidth 分位はすべて自前計算                |
 //| - 通知は SendNotification（スマホ push）のみ                     |
 //|   prev_calculated==0 の一括計算中は通知しない（描画とログは行う）|
-//| - ログ CSV は MQL5\Files\<Log_FileName>。一括計算時に作り直し、  |
-//|   以後は追記。bar_time はサーバー時刻                            |
+//| - ログ CSV は MQL5\Files\<Log_FileName>（空なら                   |
+//|   bb_alert_log_<SYMBOL>_<TF>.csv）。一括計算時に作り直し、以後は  |
+//|   追記。bar_time はサーバー時刻                                  |
+//| - Dump_Bars=true なら一括計算の完了時に確定足の OHLC を           |
+//|   bars_<SYMBOL>_<TF>.csv へ出力（bbsq_reference.py の入力）      |
 //+------------------------------------------------------------------+
 #property copyright "BB squeeze alert"
 #property version   "0.10"
@@ -75,7 +78,8 @@ input double          Sq_BwPct      = 20.0;
 input ENUM_BREAK_MODE Break_Mode    = BREAK_CLOSE;
 input bool            Alert_Enabled = true;
 input bool            Log_Enabled   = true;
-input string          Log_FileName  = "bb_alert_log.csv";
+input string          Log_FileName  = "";
+input bool            Dump_Bars     = false;
 //---- 実装固有パラメータ（判定には関与しない）
 input bool            Show_Keltner  = false;
 
@@ -103,6 +107,7 @@ int      g_warm         = 0;    // 判定を始める最初の足
 datetime g_lastAlertBar = 0;
 string   g_tf           = "";
 bool     g_warnedNotify = false;
+string   g_logName      = "";
 
 #define CSV_HEADER "platform,symbol,tf,bar_time,dir,open,close,upper,lower,mid,bw_pct,kc_up,kc_lo,sqlen,sq_mode_hit"
 
@@ -149,6 +154,12 @@ int OnInit()
    g_warm = MathMax(BB_Period + Sq_BwLookback, MathMax(KC_Period, KC_AtrPeriod));
    g_tf = StringSubstr(EnumToString((ENUM_TIMEFRAMES)_Period), 7); // "PERIOD_M15" -> "M15"
    g_processed = -1;
+   string logName = Log_FileName;
+   StringTrimLeft(logName);
+   StringTrimRight(logName);
+   if(logName == "")
+      logName = "bb_alert_log_" + _Symbol + "_" + g_tf + ".csv";
+   g_logName = SafeFileName(logName);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "BBSQ(" + (string)BB_Period + "," + DoubleToString(BB_Dev, 1) + ")");
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
@@ -193,6 +204,9 @@ int OnCalculate(const int rates_total,
       g_processed++;
       Process(g_processed, !initial, time, open, high, low, close);
      }
+
+   if(initial && Dump_Bars)
+      DumpBars(lastClosed, time, open, high, low, close);
 
    // 形成中の足は描画しない
    ClearPlots(rates_total - 1, rates_total - 1);
@@ -404,6 +418,34 @@ string HitLabel(const bool kcHit, const bool bwHit)
    return("");
   }
 
+string SafeFileName(string name)
+  {
+   string bad = "\\/:*?\"<>|";
+   for(int k = 0; k < StringLen(bad); k++)
+      StringReplace(name, StringSubstr(bad, k, 1), "_");
+   return(name);
+  }
+
+//---- 確定足 0..lastClosed の OHLC を bbsq_reference.py の入力形式で書き出す
+void DumpBars(const int lastClosed, const datetime &time[], const double &open[],
+              const double &high[], const double &low[], const double &close[])
+  {
+   string name = SafeFileName("bars_" + _Symbol + "_" + g_tf + ".csv");
+   int h = FileOpen(name, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   if(h == INVALID_HANDLE)
+     {
+      Print("BBSQ: bar dump failed, error ", GetLastError());
+      return;
+     }
+   WriteLine(h, "time,open,high,low,close");
+   for(int i = 0; i <= lastClosed; i++)
+      WriteLine(h, BarTime(time[i]) + "," + DoubleToString(open[i], _Digits) + "," +
+                DoubleToString(high[i], _Digits) + "," + DoubleToString(low[i], _Digits) + "," +
+                DoubleToString(close[i], _Digits));
+   FileClose(h);
+   PrintFormat("BBSQ: dumped %d bars to %s", lastClosed + 1, name);
+  }
+
 string F3(const double v)
   {
    return(DoubleToString(v, 3));
@@ -438,13 +480,13 @@ void WriteLine(const int h, const string line)
   {
    uchar buf[];
    int len = StringToCharArray(line + "\r\n", buf, 0, WHOLE_ARRAY, CP_UTF8) - 1; // 終端 NUL を除く
-   if(len > 0)
-      FileWriteArray(h, buf, 0, len);
+   if(len > 0 && FileWriteArray(h, buf, 0, len) != (uint)len)
+      Print("BBSQ: file write failed, error ", GetLastError());
   }
 
 void LogReset()
   {
-   int h = FileOpen(Log_FileName, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   int h = FileOpen(g_logName, FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(h == INVALID_HANDLE)
      {
       Print("BBSQ: log file init failed, error ", GetLastError());
@@ -456,13 +498,14 @@ void LogReset()
 
 void LogAppend(const string row)
   {
-   int h = FileOpen(Log_FileName, FILE_READ | FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
+   int h = FileOpen(g_logName, FILE_READ | FILE_WRITE | FILE_BIN | FILE_SHARE_READ);
    if(h == INVALID_HANDLE)
      {
       Print("BBSQ: log write failed, error ", GetLastError());
       return;
      }
-   FileSeek(h, 0, SEEK_END);
+   if(!FileSeek(h, 0, SEEK_END))
+      Print("BBSQ: file seek failed, error ", GetLastError());
    WriteLine(h, row);
    FileClose(h);
   }

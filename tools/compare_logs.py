@@ -9,6 +9,11 @@ bar_time を各プラットフォームのタイムゾーンから UTC に直し
       --ctrader-tz UTC --mt5-tz Europe/Athens --from 2026-06-26 --to 2026-09-26 \
       -o compare_result.csv
 
+実装とリファレンス実装の完全一致確認（同じ OHLC から出したログ同士）には --strict を付ける。
+(bar_time, dir) の一致に加えて価格・bw_pct・sqlen・sq_mode_hit の全列が一致しない足を value_diff とし、
+1 件でも不一致があれば終了コード 1 を返す:
+  python3 tools/compare_logs.py mt5_log.csv reference.csv --strict
+
 タイムゾーンは IANA 名（例: UTC, Europe/Athens, Asia/Tokyo）か固定オフセット（例: +02:00）で指定する。
 MT5 ブローカーのサーバー時刻は「GMT+2 / 夏時間 GMT+3」が多く、これは Europe/Athens と同じ動きになる。
 """
@@ -24,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 TIME_FMT = "%Y-%m-%d %H:%M"
+VALUE_COLUMNS = ("open", "close", "upper", "lower", "mid", "bw_pct", "kc_up", "kc_lo", "sqlen", "sq_mode_hit")
 
 
 def parse_tz(spec: str) -> tzinfo:
@@ -66,6 +72,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--to", dest="date_to", help="比較終了日（UTC、YYYY-MM-DD、含む）")
     ap.add_argument("--pip", type=float, default=0.01, help="1 pip の価格幅（GBPJPY は 0.01）")
     ap.add_argument("--pass-rate", type=float, default=90.0, help="合格ライン（%%）")
+    ap.add_argument("--strict", action="store_true",
+                    help="一致した足の全値列も比較し、1 件でも不一致なら終了コード 1（実装とリファレンスの比較用）")
     ap.add_argument("-o", "--output", help="分類結果 CSV の出力先")
     a = ap.parse_args(argv)
 
@@ -84,12 +92,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     keys = sorted(k for k in set(ct) | set(mt) if in_range(k[0]))
     out_rows = []
-    counts = {"match": 0, "ctrader_only": 0, "mt5_only": 0}
+    counts = {"match": 0, "value_diff": 0, "ctrader_only": 0, "mt5_only": 0}
     for key in keys:
         t, d = key
         c, m = ct.get(key), mt.get(key)
+        diff_cols = ""
         if c and m:
             status = "match"
+            if a.strict:
+                diffs = [col for col in VALUE_COLUMNS if c[col] != m[col]]
+                if diffs:
+                    status = "value_diff"
+                    diff_cols = " ".join(diffs)
         elif c:
             status = "ctrader_only"
         else:
@@ -108,6 +122,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "mt5_gap_pips": f"{band_gap_pips(m, a.pip):.1f}" if m else "",
                 "mt5_sqlen": m["sqlen"] if m else "",
                 "mt5_hit": m["sq_mode_hit"] if m else "",
+                **({"diff_cols": diff_cols} if a.strict else {}),
             }
         )
 
@@ -121,9 +136,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     rate = counts["match"] * 100.0 / total if total else 0.0
     print(f"signals (union): {total}")
     print(f"  match        : {counts['match']}")
+    if a.strict:
+        print(f"  value diff   : {counts['value_diff']}")
     print(f"  cTrader only : {counts['ctrader_only']}")
     print(f"  MT5 only     : {counts['mt5_only']}")
     print(f"match rate     : {rate:.1f}% (pass line {a.pass_rate:.0f}%) -> {'PASS' if rate >= a.pass_rate else 'FAIL'}")
+    if a.strict:
+        exact = counts["match"] == total
+        print(f"strict         : {'EXACT MATCH' if exact else 'MISMATCH'}")
+        return 0 if exact else 1
     print("片側のみの足: gap_pips が小さい（数 pips 未満）なら価格差、sqlen が Sq_MinBars 付近なら SqLen 差を疑う")
     return 0
 
